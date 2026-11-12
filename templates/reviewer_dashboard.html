@@ -15,13 +15,21 @@
     <h2>新建卡片与双录任务</h2>
     <p>扫描图支持 PNG、JPEG、GIF、WebP，单张不超过 16 MB。</p>
   </div>
-  <form method="post" action="{{ url_for('upload_card') }}" enctype="multipart/form-data" class="upload-form">
+  <p class="hint upload-hint">
+    同一份表单可以放心重发：网络卡住或连点提交都不会重复建卡，每次都会打开同一张卡。
+    没有现成扫描图？可
+    <a href="{{ url_for('demo_scan') }}">下载演示扫描样图（PNG）</a>
+    后直接选择上传。若要改卡号、换录入员或换图片，请先
+    <a href="{{ url_for('reviewer_dashboard') }}">重新打开工作台</a>另开一份新表单。
+  </p>
+  <form method="post" action="{{ url_for('upload_card') }}" enctype="multipart/form-data" class="upload-form" data-upload-form>
+    <input type="hidden" name="upload_form_token" value="{{ upload_form_token }}">
     <label class="field">
       <span>卡片编号 <em>可留空自动生成</em></span>
       <input type="text" name="card_no" maxlength="60" placeholder="例如 YC-1986-0718" autocomplete="off">
     </label>
     <label class="field field-file">
-      <span>扫描原图 <em>必填</em></span>
+      <span>扫描原图 <em>必填 · <a href="{{ url_for('demo_scan') }}">下载演示样图</a></em></span>
       <input type="file" name="scan" accept="image/png,image/jpeg,image/gif,image/webp" required>
     </label>
     <label class="field">
@@ -40,7 +48,7 @@
         {% endfor %}
       </select>
     </label>
-    <button type="submit" class="button button-primary">建立双录任务</button>
+    <button type="submit" class="button button-primary" data-upload-submit>建立双录任务</button>
   </form>
 </section>
 
@@ -130,4 +138,25 @@
   <strong>核定口径</strong>
   <p>两份最新录入完全一致时自动核定；不一致时必须由复核员对照原图选一份。任何一份改填都会立刻撤销旧裁定，旧页面提交的裁定会被拒绝。</p>
 </div>
+
+<div class="notice subtle-notice">
+  <strong>重发与另开表单</strong>
+  <p>每份上传表单带一次性标识：原样重发（连点、超时重试、重启后重试）只会进入第一次建立的那张卡，不产生重复卡或重复图片。已经成功建卡的表单若改动卡号、录入员分工或图片内容，会被拦下并提示另开新表单；新表单照常建卡。建卡失败时不留下卡片或图片文件，可直接重试原表单。</p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Belt-and-braces against double clicks; the server stays the real guarantee,
+  // so a disabled button never changes idempotency semantics.
+  document.querySelectorAll('form[data-upload-form]').forEach(function (form) {
+    form.addEventListener('submit', function () {
+      var button = form.querySelector('[data-upload-submit]');
+      if (button) {
+        button.disabled = true;
+        button.textContent = '正在提交…';
+      }
+    });
+  });
+</script>
 {% endblock %}

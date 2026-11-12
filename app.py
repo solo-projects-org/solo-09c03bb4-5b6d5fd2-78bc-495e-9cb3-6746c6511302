@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import os
 import secrets
@@ -54,6 +55,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         DATABASE=os.environ.get("DATABASE_PATH", str(BASE_DIR / "data" / "rainfall.db")),
         UPLOAD_DIR=os.environ.get("UPLOAD_DIR", str(BASE_DIR / "data" / "uploads")),
         SAMPLE_CARD_DIR=str(BASE_DIR / "sample_cards"),
+        DEMO_SCAN_FILENAME="rain-card-demo.png",
         MAX_CONTENT_LENGTH=16 * 1024 * 1024,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
@@ -72,6 +74,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     with app.app_context():
         init_db()
         seed_demo_data()
+        cleanup_orphan_uploads()
 
     register_routes(app)
     register_template_helpers(app)
@@ -105,6 +108,29 @@ def init_db() -> None:
     db.executescript((BASE_DIR / "schema.sql").read_text(encoding="utf-8"))
     db.execute("PRAGMA journal_mode = WAL")
     db.commit()
+
+
+def cleanup_orphan_uploads() -> None:
+    """Remove saved scan files that no card references.
+
+    A card, its upload-request row and the image file are committed together;
+    this only matters when the process was killed mid-upload or a volume was
+    copied across versions. Running it at startup also completes a rollback
+    after a crash (the database row disappears, the file would otherwise stay).
+    """
+    db = get_db()
+    referenced = {
+        row[0]
+        for row in db.execute(
+            "SELECT image_filename FROM cards WHERE image_filename NOT LIKE 'sample:%'"
+        ).fetchall()
+    }
+    upload_dir = Path(current_app.config["UPLOAD_DIR"])
+    if not upload_dir.is_dir():
+        return
+    for entry in upload_dir.iterdir():
+        if entry.is_file() and entry.name not in referenced:
+            entry.unlink(missing_ok=True)
 
 
 def seed_demo_data() -> None:
@@ -423,6 +449,22 @@ def sniff_image(head: bytes) -> tuple[str, str] | None:
     return None
 
 
+def new_upload_token() -> str:
+    """Identifier of one rendered upload form; equal tokens mean the same form."""
+    return uuid.uuid4().hex
+
+
+def uploaded_file_sha256(scan) -> str:
+    """Hash the exact bytes a reviewer chose; the client filename is irrelevant."""
+    stream = scan.stream
+    stream.seek(0)
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+    stream.seek(0)
+    return digest.hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -631,16 +673,27 @@ def register_routes(app: Flask) -> None:
             clerks=clerks,
             counts=counts,
             selected_status=selected_status,
+            upload_form_token=new_upload_token(),
         )
 
     @app.post("/reviewer/upload")
     @role_required("reviewer")
     def upload_card():
         db = get_db()
-        card_no = (request.form.get("card_no") or "").strip()
+        form_token = (request.form.get("upload_form_token") or "").strip()
+        if not form_token or len(form_token) > 64 or not all(
+            ch in "0123456789abcdef" for ch in form_token
+        ):
+            flash("上传表单已失效，请重新打开工作台后再试。", "error")
+            return redirect(url_for("reviewer_dashboard"))
+
+        raw_card_no = (request.form.get("card_no") or "").strip()
         clerk_a_raw = request.form.get("clerk_a_id") or ""
         clerk_b_raw = request.form.get("clerk_b_id") or ""
 
+        # The blank-number case is normal: remember that the field was empty so
+        # an auto-generated number cannot make a modified resubmit look identical.
+        card_no = raw_card_no
         if not card_no:
             card_no = f"YC-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{secrets.token_hex(2).upper()}"
         if len(card_no) > 60 or any(ord(ch) < 32 or ord(ch) == 127 for ch in card_no):
@@ -672,35 +725,100 @@ def register_routes(app: Flask) -> None:
         if kind is None:
             flash("扫描图须为 PNG、JPEG、GIF 或 WebP 图片。", "error")
             return redirect(url_for("reviewer_dashboard"))
+        image_sha256 = uploaded_file_sha256(scan)
 
-        ext, _mimetype = kind
-        filename = f"{uuid.uuid4().hex}{ext}"
-        destination = Path(app.config["UPLOAD_DIR"]) / filename
-        scan.save(destination)
-
+        # Everything below runs under one write lock. Two concurrent resends of
+        # the same form serialise here; the second one finds the finished
+        # upload_requests row and returns the same card instead of duplicating it.
+        db.execute("BEGIN IMMEDIATE")
+        destination: Path | None = None
         try:
-            cur = db.execute(
-                """INSERT INTO cards
-                   (card_no, image_filename, clerk_a_id, clerk_b_id, created_by, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    card_no,
-                    filename,
-                    clerk_a_id,
-                    clerk_b_id,
-                    g.user["id"],
-                    utc_now(),
-                ),
-            )
-            db.commit()
-        except sqlite3.IntegrityError:
+            existing = db.execute(
+                "SELECT * FROM upload_requests WHERE form_token = ?",
+                (form_token,),
+            ).fetchone()
+            if existing is not None:
+                same_content = (
+                    existing["card_no"] == raw_card_no
+                    and existing["clerk_a_id"] == clerk_a_id
+                    and existing["clerk_b_id"] == clerk_b_id
+                    and existing["image_sha256"] == image_sha256
+                )
+                if not same_content:
+                    db.rollback()
+                    flash(
+                        "这份上传表单已经建立过卡片；卡号、录入员分工或图片被改动后，"
+                        "请重新打开工作台另开一份新表单再提交。",
+                        "warning",
+                    )
+                    return redirect(
+                        url_for("reviewer_card", card_id=existing["card_id"])
+                    )
+                card_id = existing["card_id"]
+                db.commit()
+                flash(
+                    "这份表单已提交过，已直接打开原先建立的卡片，未重复建卡。",
+                    "success",
+                )
+                return redirect(url_for("reviewer_card", card_id=card_id))
+
+            ext, _mimetype = kind
+            filename = f"{uuid.uuid4().hex}{ext}"
+            destination = Path(app.config["UPLOAD_DIR"]) / filename
+            scan.save(destination)
+            now = utc_now()
+
+            try:
+                cur = db.execute(
+                    """INSERT INTO cards
+                       (card_no, image_filename, clerk_a_id, clerk_b_id,
+                        created_by, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        card_no,
+                        filename,
+                        clerk_a_id,
+                        clerk_b_id,
+                        g.user["id"],
+                        now,
+                    ),
+                )
+                card_id = cur.lastrowid
+                # The request record, card and filename reference are committed
+                # as one unit, so the idempotency mapping survives a restart and
+                # there is never a card without a usable image (or vice versa).
+                db.execute(
+                    """INSERT INTO upload_requests
+                       (form_token, card_id, card_no, clerk_a_id, clerk_b_id,
+                        image_sha256, image_filename, created_by, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        form_token,
+                        card_id,
+                        raw_card_no,
+                        clerk_a_id,
+                        clerk_b_id,
+                        image_sha256,
+                        filename,
+                        g.user["id"],
+                        now,
+                    ),
+                )
+                db.commit()
+            except sqlite3.IntegrityError:
+                db.rollback()
+                if destination is not None:
+                    destination.unlink(missing_ok=True)
+                flash("卡片编号已存在，请换一个编号。", "error")
+                return redirect(url_for("reviewer_dashboard"))
+        except Exception:
             db.rollback()
-            destination.unlink(missing_ok=True)
-            flash("卡片编号已存在，请换一个编号。", "error")
-            return redirect(url_for("reviewer_dashboard"))
+            if destination is not None:
+                destination.unlink(missing_ok=True)
+            raise
 
         flash(f"卡片 {card_no} 已建立，两位录入员可以开始录入。", "success")
-        return redirect(url_for("reviewer_card", card_id=cur.lastrowid))
+        return redirect(url_for("reviewer_card", card_id=card_id))
 
     @app.get("/reviewer/cards/<int:card_id>")
     @role_required("reviewer")
@@ -880,6 +998,20 @@ def register_routes(app: Flask) -> None:
                 "Content-Disposition": f'attachment; filename="{filename}"',
             },
         )
+
+    @app.get("/reviewer/demo-scan")
+    @role_required("reviewer")
+    def demo_scan():
+        # A ready-to-upload sample scan so the resend flow can be demonstrated
+        # without preparing an image first.
+        response = send_from_directory(
+            app.config["SAMPLE_CARD_DIR"],
+            app.config["DEMO_SCAN_FILENAME"],
+            as_attachment=True,
+            download_name=app.config["DEMO_SCAN_FILENAME"],
+        )
+        response.headers["Cache-Control"] = "private, max-age=3600"
+        return response
 
     @app.get("/cards/<int:card_id>/image")
     @login_required

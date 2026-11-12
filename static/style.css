@@ -665,3 +665,14 @@ em { font-style: normal; }
   .comparison-table { min-width: 620px; }
   .page { width: calc(100% - 1.2rem); }
 }
+
+/* Idempotent upload form */
+.upload-hint { margin: 0.6rem 0 0.9rem; max-width: 60rem; }
+.upload-hint a { color: var(--green-dark); font-weight: 600; }
+.upload-form .button:disabled,
+.upload-form .button[disabled] {
+  opacity: 0.65;
+  cursor: progress;
+  transform: none;
+  box-shadow: none;
+}

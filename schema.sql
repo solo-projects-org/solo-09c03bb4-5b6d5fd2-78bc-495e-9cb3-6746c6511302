@@ -20,6 +20,28 @@ CREATE TABLE IF NOT EXISTS cards (
     CHECK (clerk_a_id <> clerk_b_id)
 );
 
+-- One row per *upload form* that was successfully turned into a card. The
+-- form_token is generated when the reviewer opens the workbench and travels in
+-- a hidden field. Re-sending the same form (double click, retry, retry after a
+-- restart) carries the same token and returns the existing card instead of
+-- building a second one. A completed request is committed together with its
+-- card and image filename, so the mapping survives restarts.
+CREATE TABLE IF NOT EXISTS upload_requests (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    form_token     TEXT    NOT NULL UNIQUE,
+    card_id        INTEGER NOT NULL UNIQUE REFERENCES cards(id),
+    -- Snapshot of what this form carried, used to detect a modified resubmit.
+    card_no        TEXT    NOT NULL,
+    clerk_a_id     INTEGER NOT NULL,
+    clerk_b_id     INTEGER NOT NULL,
+    image_sha256   TEXT    NOT NULL,
+    image_filename TEXT    NOT NULL,
+    created_by     INTEGER NOT NULL REFERENCES users(id),
+    created_at     TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_upload_requests_card ON upload_requests(card_id);
+
 CREATE TABLE IF NOT EXISTS entries (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     card_id       INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
